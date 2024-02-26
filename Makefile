@@ -27,16 +27,17 @@ OS     ?= $(shell go env GOOS)
 HELM_VERSION ?= 3.12.3
 KUBEBUILDER_TOOLS_VERISON ?= 1.28.0
 KUBECTL_VERSION ?= 1.28.2
+YQ_VERSION ?= v4.40.5
 KIND_VERSION ?= $(shell grep "sigs.k8s.io/kind" go.mod | awk '{print $$NF}')
 GINKGO_VERSION ?= $(shell grep "github.com/onsi/ginkgo/v2" go.mod | awk '{print $$NF}')
-HELM_DOCS_VERSION ?= $(shell grep "github.com/norwoodj/helm-docs" hack/tools/go.mod | awk '{print $$NF}')
+HELM_TOOL_VERSION ?= $(shell grep "github.com/cert-manager/helm-tool" hack/tools/go.mod | awk '{print $$NF}')
 BOILERSUITE_VERSION ?= $(shell grep "github.com/cert-manager/boilersuite" hack/tools/go.mod | awk '{print $$NF}')
 CONTROLLER_TOOLS_VERSION ?= $(shell grep "sigs.k8s.io/controller-tools" hack/tools/go.mod | awk '{print $$NF}')
 CODE_GENERATOR_VERSION ?= $(shell grep "k8s.io/code-generator" hack/tools/go.mod | awk '{print $$NF}')
 
 IMAGE_PLATFORMS ?= linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le
 
-RELEASE_VERSION ?= v0.7.0
+RELEASE_VERSION ?= v0.8.0
 
 BUILDX_BUILDER ?= trust-manager-builder
 
@@ -46,6 +47,9 @@ CONTAINER_REGISTRY_API_URL ?= https://quay.io/v2/jetstack/cert-manager-package-d
 GOPROXY ?= https://proxy.golang.org,direct
 
 GO_SOURCES := $(shell find . -name "*.go") go.mod go.sum
+
+CGO_ENABLED ?= 0
+GOEXPERIMENT ?= # empty by default
 
 CI ?=
 
@@ -85,7 +89,6 @@ verify-%: FORCE
 verify: ## build, test and verify generate tagets
 verify: depend build test
 verify: verify-generate
-verify: verify-update-helm-docs
 
 .PHONY: verify-boilerplate
 verify-boilerplate: | $(BINDIR)/boilersuite-$(BOILERSUITE_VERSION)/boilersuite
@@ -98,11 +101,20 @@ vet:
 .PHONY: build
 build: $(BINDIR)/trust-manager | $(BINDIR) ## build trust-manager for the host system architecture
 
+.PHONY: build-linux-amd64 build-linux-arm64 build-linux-ppc64le build-linux-arm
+build-linux-amd64 build-linux-arm64 build-linux-ppc64le build-linux-arm: build-linux-%: $(BINDIR)/trust-manager-linux-%
+
 $(BINDIR)/trust-manager: $(GO_SOURCES) | $(BINDIR)
-	CGO_ENABLED=0 go build -o $(BINDIR)/trust-manager ./cmd/trust-manager
+	CGO_ENABLED=$(CGO_ENABLED) GOEXPERIMENT=$(GOEXPERIMENT) \
+		go build -o $(BINDIR)/trust-manager ./cmd/trust-manager
+
+$(BINDIR)/trust-manager-linux-amd64 $(BINDIR)/trust-manager-linux-arm64 $(BINDIR)/trust-manager-linux-ppc64le $(BINDIR)/trust-manager-linux-arm: $(BINDIR)/trust-manager-linux-%: $(GO_SOURCES) | $(BINDIR)
+	CGO_ENABLED=$(CGO_ENABLED) GOEXPERIMENT=$(GOEXPERIMENT) \
+		GOOS=linux GOARCH=$* \
+		go build -o $@ ./cmd/trust-manager
 
 .PHONY: generate
-generate: depend generate-deepcopy generate-applyconfigurations generate-manifests
+generate: depend generate-deepcopy generate-applyconfigurations generate-manifests generate-helm-docs generate-helm-schema
 
 .PHONY: generate-deepcopy
 generate-deepcopy: ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -126,12 +138,12 @@ generate-applyconfigurations: | $(BINDIR)/code-generator-$(CODE_GENERATOR_VERSIO
 
 .PHONY: generate-manifests
 generate-manifests: ## Generate CustomResourceDefinition objects.
-generate-manifests: $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION)/controller-gen
-	./hack/update-codegen.sh $<
+generate-manifests: $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION)/controller-gen $(BINDIR)/yq-$(YQ_VERSION)/yq
+	./hack/update-codegen.sh $^
 
 # See wait-for-buildx.sh for an explanation of why it's needed
 .PHONY: provision-buildx
-provision-buildx:  ## set up docker buildx for multiarch building
+provision-buildx:  ## set up docker buildx for multiarch building; required for building images
 ifeq ($(OS), linux)
 	# This step doesn't work on macOS and doesn't seem to be required (at least with docker desktop)
 	# It did seem to be needed in Linux, at least in certain configurations when running on amd64
@@ -140,15 +152,15 @@ ifeq ($(OS), linux)
 endif
 	docker buildx rm $(BUILDX_BUILDER) &>/dev/null || :
 	./hack/wait-for-buildx.sh $(BUILDX_BUILDER) gone
-	docker buildx create --name $(BUILDX_BUILDER) --driver docker-container --use
+	docker buildx create --name $(BUILDX_BUILDER) --bootstrap --driver docker-container --platform $(IMAGE_PLATFORMS)
 	./hack/wait-for-buildx.sh $(BUILDX_BUILDER) exists
 	docker buildx inspect --bootstrap --builder $(BUILDX_BUILDER)
 
 .PHONY: image
-image: trust-manager-save trust-package-debian-save | $(BINDIR) ## build docker images targeting all supported platforms and save to disk
+image: trust-manager-save | $(BINDIR) ## build trust-manager container images targeting all supported platforms and save to disk. Requires `make provision-buildx`
 
 .PHONY: local-images
-local-images: trust-manager-load trust-package-debian-load  ## build container images for only amd64 and load into docker
+local-images: trust-manager-load trust-package-debian-load  ## build container images for only the local architecture and load into docker. Requires `make provision-buildx`
 
 .PHONY: kind-load
 kind-load: local-images | $(BINDIR)/kind-$(KIND_VERSION)/kind  ## same as local-images but also run "kind load docker-image"
@@ -161,9 +173,13 @@ kind-load: local-images | $(BINDIR)/kind-$(KIND_VERSION)/kind  ## same as local-
 chart: | $(BINDIR)/helm-$(HELM_VERSION)/helm $(BINDIR)/chart
 	$(BINDIR)/helm-$(HELM_VERSION)/helm package --app-version=$(RELEASE_VERSION) --version=$(RELEASE_VERSION) --destination "$(BINDIR)/chart" ./deploy/charts/trust-manager
 
-.PHONY: update-helm-docs
-update-helm-docs: | $(BINDIR)/helm-docs-$(HELM_DOCS_VERSION)/helm-docs  ## update Helm README, generated from other Helm files
-	./hack/update-helm-docs.sh $(BINDIR)/helm-docs-$(HELM_DOCS_VERSION)/helm-docs
+.PHONY: generate-helm-docs
+generate-helm-docs: | $(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)/helm-tool  ## update Helm README, generated from other Helm files
+	./hack/update-helm-tool.sh $(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)/helm-tool
+
+.PHONY: generate-helm-schema
+generate-helm-schema: | $(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)/helm-tool  ## update Helm README, generated from other Helm files
+	$(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)/helm-tool schema -i ./deploy/charts/trust-manager/values.yaml | jq > ./deploy/charts/trust-manager/values.schema.json
 
 .PHONY: clean
 clean: ## clean up created files
@@ -205,7 +221,7 @@ ensure-trust-manager: ensure-kind kind-load ensure-cert-manager | $(BINDIR)/helm
 	$(BINDIR)/helm-$(HELM_VERSION)/helm uninstall --kubeconfig $(BINDIR)/kubeconfig.yaml -n cert-manager trust-manager || :
 	$(BINDIR)/helm-$(HELM_VERSION)/helm upgrade --kubeconfig $(BINDIR)/kubeconfig.yaml -i -n cert-manager trust-manager deploy/charts/trust-manager/. \
 		--set image.tag=latest \
-		--set defaultTrustPackage.tag=latest$(DEBIAN_TRUST_PACKAGE_SUFFIX) \
+		--set defaultPackageImage.tag=latest$(DEBIAN_TRUST_PACKAGE_SUFFIX) \
 		--set app.logLevel=2 \
 		--set secretTargets.enabled=true --set secretTargets.authorizedSecretsAll=true \
 		--wait
@@ -235,12 +251,13 @@ depend: $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION)/controller-gen
 depend: $(BINDIR)/code-generator-$(CODE_GENERATOR_VERSION)/applyconfiguration-gen
 depend: $(BINDIR)/boilersuite-$(BOILERSUITE_VERSION)/boilersuite
 depend: $(BINDIR)/kind-$(KIND_VERSION)/kind
-depend: $(BINDIR)/helm-docs-$(HELM_DOCS_VERSION)/helm-docs
+depend: $(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)/helm-tool
 depend: $(BINDIR)/helm-$(HELM_VERSION)/helm
 depend: $(BINDIR)/ginkgo-$(GINKGO_VERSION)/ginkgo
 depend: $(BINDIR)/kubectl-$(KUBECTL_VERSION)/kubectl
 depend: $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON)/kube-apiserver
 depend: $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON)/etcd
+depend: $(BINDIR)/yq-$(YQ_VERSION)/yq
 
 $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION)/controller-gen: | $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION)
 	cd hack/tools && go build -o $@ sigs.k8s.io/controller-tools/cmd/controller-gen
@@ -254,8 +271,8 @@ $(BINDIR)/boilersuite-$(BOILERSUITE_VERSION)/boilersuite: | $(BINDIR)/boilersuit
 $(BINDIR)/kind-$(KIND_VERSION)/kind: | $(BINDIR)/kind-$(KIND_VERSION)
 	cd hack/tools && go build -o $@ sigs.k8s.io/kind
 
-$(BINDIR)/helm-docs-$(HELM_DOCS_VERSION)/helm-docs: | $(BINDIR)/helm-docs-$(HELM_DOCS_VERSION)
-	cd hack/tools && go build -o $@ github.com/norwoodj/helm-docs/cmd/helm-docs
+$(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)/helm-tool: | $(BINDIR)/helm-tool-$(HELM_TOOL_VERSION)
+	cd hack/tools && go build -o $@ github.com/cert-manager/helm-tool
 
 $(BINDIR)/helm-$(HELM_VERSION)/helm: $(BINDIR)/helm-$(HELM_VERSION)/helm-v$(HELM_VERSION)-$(OS)-$(ARCH).tar.gz | $(BINDIR)
 	tar xfO $< $(OS)-$(ARCH)/helm > $@ && chmod +x $@
@@ -278,7 +295,10 @@ $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON)/kube-apiserver: $(BINDIR)/kub
 $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON)/envtest-bins.tar.gz: | $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON)
 	curl -sSL -o $@ "https://storage.googleapis.com/kubebuilder-tools/kubebuilder-tools-$(KUBEBUILDER_TOOLS_VERISON)-$(OS)-$(ARCH).tar.gz"
 
-$(BINDIR) $(BINDIR)/kubectl-$(KUBECTL_VERSION) $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON) $(BINDIR)/chart $(BINDIR)/ginkgo-$(GINKGO_VERSION) $(BINDIR)/helm-$(HELM_VERSION) $(BINDIR)/helm-docs-$(HELM_DOCS_VERSION) $(BINDIR)/kind-$(KIND_VERSION) $(BINDIR)/boilersuite-$(BOILERSUITE_VERSION) $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION) $(BINDIR)/code-generator-$(CODE_GENERATOR_VERSION):
+$(BINDIR)/yq-$(YQ_VERSION)/yq: | $(BINDIR)/yq-$(YQ_VERSION)
+	curl -o $@ -L "https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(OS)_$(ARCH)" && chmod +x $@
+
+$(BINDIR) $(BINDIR)/kubectl-$(KUBECTL_VERSION) $(BINDIR)/kubebuilder-$(KUBEBUILDER_TOOLS_VERISON) $(BINDIR)/chart $(BINDIR)/ginkgo-$(GINKGO_VERSION) $(BINDIR)/helm-$(HELM_VERSION) $(BINDIR)/helm-tool-$(HELM_TOOL_VERSION) $(BINDIR)/kind-$(KIND_VERSION) $(BINDIR)/boilersuite-$(BOILERSUITE_VERSION) $(BINDIR)/controller-tools-$(CONTROLLER_TOOLS_VERSION) $(BINDIR)/code-generator-$(CODE_GENERATOR_VERSION) $(BINDIR)/yq-$(YQ_VERSION):
 	@mkdir -p $@
 
 _FORCE:
